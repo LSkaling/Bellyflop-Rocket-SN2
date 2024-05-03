@@ -9,13 +9,14 @@
 #include <Adafruit_Sensor.h>
 #include "Adafruit_BMP3XX.h"
 
+const bool DEBUG = false;
+
 IntervalTimer logDataTimer; // Create an IntervalTimer object
 IntervalTimer printDataTimer;
 IntervalTimer saveSDTimer;
 
 File myFile;
 
-//Adafruit_MPL3115A2 mpl;
 Adafruit_ICM20948 icm;
 Adafruit_Sensor *icm_temp, *icm_accel, *icm_gyro, *icm_mag;
 
@@ -44,14 +45,19 @@ int topRightError = 0;
 int bottomLeftError = 0;
 int bottomRightError = 0;
 
+int previousTopLeftError = 0;
+int previousTopRightError = 0;
+int previousBottomLeftError = 0;
+int previousBottomRightError = 0;
+
 int tlFlap = 0;
 int trFlap = 0;
 int blFlap = 0;
 int brFlap = 0;
 
 const float alpha = 0.3;
-const float roll_sensitivity = 1.5; //0.7?
-const float pitch_sensitivity = 0.7; // 0.9?
+const float roll_sensitivity = 0; //1 for SN2 drop 2.
+const float pitch_sensitivity = 1.5; // 0.9?
 
 #define ICM_CS 10
 
@@ -66,6 +72,16 @@ int onTime = 0;
 int offTime = 0;
 
 bool balance = false;
+
+const float P = 1;
+const float D = 0;
+
+int delay_start_millis = 0;
+int loop_start_millis = 0;
+
+int neutral_angle = 45;
+
+int fileIndex = 1;
 
 void logData() {
   myFile.print(temp.temperature);
@@ -112,7 +128,8 @@ void logData() {
 
 void saveSD(){
   myFile.close();
-  myFile = SD.open("test.txt", FILE_WRITE);
+  String fileName = "test" + String(fileIndex) + ".txt";
+  myFile = SD.open(fileName.c_str(), FILE_WRITE);
   if(!myFile){
     Serial.println("Error opening file");
     sensorError = true;
@@ -162,19 +179,9 @@ void printData(){
 
   Serial.print("\t\tTop Left Error: "); Serial.print(topLeftError); Serial.print("\tTop Right Error: "); Serial.print(topRightError); Serial.print("\tBottom Left Error: "); Serial.print(bottomLeftError); Serial.print("\tBottom Right Error: "); Serial.println(bottomRightError);
 
-  Serial.print("receiver"); Serial.print(", ");Serial.print(onTime); Serial.print(", ");Serial.print(offTime);
+  Serial.print("receiver"); Serial.print(", ");Serial.print(onTime); Serial.print(", ");Serial.print(offTime);Serial.print(", start delay: ");Serial.print(loop_start_millis - delay_start_millis);
 
 }
-
-// void getPressure(){
-//   if(mpl.conversionComplete()){
-//     pressure = mpl.getLastConversionResults(MPL3115A2_PRESSURE);
-//     temperature = mpl.getLastConversionResults(MPL3115A2_TEMPERATURE);
-    
-//   }
-// }
-
-
 
 void pwmChange(){
   if(digitalRead(39) == HIGH){
@@ -188,7 +195,6 @@ void pwmChange(){
   
 }
 
-
 void setup(void) {
   Serial.begin(115200);
 
@@ -197,7 +203,7 @@ void setup(void) {
   bottomLeft.attachServo();
   bottomRight.attachServo();
 
-  attachInterrupt(digitalPinToInterrupt(39), pwmChange, CHANGE);
+  //attachInterrupt(digitalPinToInterrupt(39), pwmChange, CHANGE);
 
   // topLeft.calibrate(); //1775 is down, 885 is up
   // topRight.calibrate(); // 1165 is down, 1955 is up
@@ -218,10 +224,6 @@ void setup(void) {
 
   // delay(600);
 
-
-
-  // pressureTimer.begin(getPressure, 2000000); // 0.5 hz pressure reading
-
   // Initialize peripherals
 
   if (!icm.begin_I2C()) {
@@ -235,7 +237,20 @@ void setup(void) {
     sensorError = true;
     while (1) {}
   }
-  myFile = SD.open("test.txt", FILE_WRITE);
+
+  while (true) {
+    String fileName = "test" + String(fileIndex) + ".txt";
+    if (!SD.exists(fileName.c_str())) { // Check if file exists
+      // File does not exist, create it
+      myFile = SD.open(fileName.c_str(), FILE_WRITE);
+      if (!myFile) {
+        Serial.println("Error opening " + fileName);
+      }
+      break;
+    }
+    fileIndex++; // Increment the file index if the file exists
+  }  
+
 
   if(!myFile){
     Serial.println("Error opening file");
@@ -270,19 +285,26 @@ void setup(void) {
   bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
   bmp.setOutputDataRate(BMP3_ODR_50_HZ);
 
-  Serial.println("Setup complete!");
+  Serial.println("Setup complete! Waiting for release.");
 
-  while(onTime < 2){
-    digitalWrite(LED_BUILTIN, HIGH);
-    delay(400);
-    digitalWrite(LED_BUILTIN, LOW);
-    delay(1000);
+
+  // topLeft.writePercentage(100);
+  // topRight.writePercentage(100);
+  // bottomLeft.writePercentage(0);
+  // bottomRight.writePercentage(0); 
+
+  //while(onTime < 2){  }
+  
+  delay_start_millis = millis();
+
+
+  if(DEBUG){ 
+    printDataTimer.begin(printData, 100000); // 10 hz printing
+  }else{
+    logDataTimer.begin(logData, 50000); // 20 hz logging
+    saveSDTimer.begin(saveSD, 2000000); // 0.5 hz saving to SD
   }
-  //logDataTimer.begin(logData, 50000); // 10 hz logging
-  printDataTimer.begin(printData, 100000); // 10 hz printing
-  //saveSDTimer.begin(saveSD, 2000000); // 0.5 hz saving to SD
-
-  detachInterrupt(digitalPinToInterrupt(39));
+  //detachInterrupt(digitalPinToInterrupt(39));
 
 }
 
@@ -297,6 +319,10 @@ float ay = 0;
 float az = 0;
 
 void loop() {
+  if(loop_start_millis == 0){
+    loop_start_millis = millis();
+  }
+
   previousLoopTime = currentLoopTime;
   currentLoopTime = millis();
   rollingLoopTime = currentLoopTime - previousLoopTime;
@@ -315,25 +341,33 @@ void loop() {
   ay = alpha * accel.acceleration.x + (1 - alpha) * ay;
   az = alpha * accel.acceleration.z + (1 - alpha) * az;
 
-  pitch = (atan2(ay, sqrt(ax * ax + az * az)) * 180 / M_PI) * roll_sensitivity;
-  roll = (atan2(ax, sqrt(ay * ay + az * az)) * 180 / M_PI) * pitch_sensitivity;
+  pitch = (atan2(ay, sqrt(ax * ax + az * az)) * 180 / M_PI) * pitch_sensitivity;
+  roll = (atan2(ax, sqrt(ay * ay + az * az)) * 180 / M_PI) * roll_sensitivity;
 
-  topLeftError = -pitch;
-  topRightError = -pitch;
-  bottomLeftError = pitch;
-  bottomRightError = pitch;
+  topLeftError = pitch + roll;
+  topRightError = pitch - roll;
+  bottomLeftError = -pitch + roll;
+  bottomRightError = -pitch - roll;
 
-  tlFlap = topLeftError + 45;
-  trFlap = topRightError + 45;
-  blFlap = bottomLeftError + 45;
-  brFlap = bottomRightError + 45;
+  float d_tle = topLeftError - previousTopLeftError;
+  float d_tre = topRightError - previousTopRightError;
+  float d_ble = bottomLeftError - previousBottomLeftError;
+  float d_bre = bottomRightError - previousBottomLeftError;
+
+  tlFlap = P*topLeftError + D*d_tle + neutral_angle;
+  trFlap = P*topRightError + D*d_tre+ neutral_angle;
+  blFlap = P*bottomLeftError + D*d_ble + neutral_angle;
+  brFlap = P*bottomRightError + D*d_bre+ neutral_angle;
 
   topLeft.writePercentage(tlFlap);
   topRight.writePercentage(trFlap);
   bottomLeft.writePercentage(blFlap);
   bottomRight.writePercentage(brFlap);
-  
 
+  previousTopLeftError = topLeftError;
+  previousTopRightError = topRightError;
+  previousBottomLeftError = bottomLeftError;
+  previousBottomRightError = bottomRightError;
 }
 
 
