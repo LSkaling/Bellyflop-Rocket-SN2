@@ -9,11 +9,14 @@
 #include <Adafruit_Sensor.h>
 #include "Adafruit_BMP3XX.h"
 
+#define ICM_CS 10
+
 const bool DEBUG = false;
 
 IntervalTimer logDataTimer; // Create an IntervalTimer object
 IntervalTimer printDataTimer;
 IntervalTimer saveSDTimer;
+IntervalTimer statusBeepTimer;
 
 File myFile;
 
@@ -26,6 +29,8 @@ sensors_event_t temp;
 sensors_event_t mag;
 
 Adafruit_BMP3XX bmp;
+
+Servo release;
 
 float pressure;
 float altitude;
@@ -40,57 +45,56 @@ float rollingLoopTime = 0;
 float previousLoopTime = 0;
 float currentLoopTime = 0;
 
-int topLeftError = 0;
-int topRightError = 0;
-int bottomLeftError = 0;
-int bottomRightError = 0;
-
-int previousTopLeftError = 0;
-int previousTopRightError = 0;
-int previousBottomLeftError = 0;
-int previousBottomRightError = 0;
-
-int tlFlap = 0;
-int trFlap = 0;
-int blFlap = 0;
-int brFlap = 0;
-
-const float alpha = 0.3;
-const float roll_sensitivity = 0; //1 for SN2 drop 2.
-const float pitch_sensitivity = 1.5; // 0.9?
-
-#define ICM_CS 10
-
-Flap topLeft(9, 1775, 885);
-Flap topRight(10, 1165, 1955);
-Flap bottomLeft(11, 995, 1930);
-Flap bottomRight(12, 1525, 705);
-
-int risingEdgeTime = 0;
-int fallingEdgeTime = 0;
-int onTime = 0;
-int offTime = 0;
-
-bool balance = false;
-
-const float P = 1;
-const float D = 0;
-
 int delay_start_millis = 0;
 int loop_start_millis = 0;
 
-int neutral_angle = 45;
-
 int fileIndex = 1;
+
+const int ematch_1 = 10;
+const int ematch_2 = 11;
+const int motor_1 = 8;
+const int motor_2 = 9;
+
+const int buzzer = 34;
+
+const int servo = 12;
+
+const float sensitivity = 2.8;
+
+float dz = 0; //change in altitude meters per second
+float previousAltitude = 0;
+
+float ax = 0;
+float ay = 0;
+float az = 0;
+
+float motorPower = 0;
+
+enum State{
+  WAITING,
+  LAUNCHED,
+  APOGEE,
+  BELLYFLOP,
+  CHUTE,
+  LANDED
+};
+
+void waiting_state();
+void launched_state();
+void apogee_state();
+void bellyflop_state();
+void chute_state();
+
+State currentState = WAITING;
 
 void logData() {
   myFile.print(temp.temperature);
   myFile.print(", ");
-  myFile.print(accel.acceleration.x);
+  myFile.print(ax);
   myFile.print(", ");
-  myFile.print(accel.acceleration.y);
+  myFile.print(ay);
   myFile.print(", ");
-  myFile.print(accel.acceleration.z);
+  myFile.print(az);
   myFile.print(", ");
   myFile.print(gyro.gyro.x);
   myFile.print(", ");
@@ -116,14 +120,11 @@ void logData() {
   myFile.print(", ");
   myFile.print(sensorError);
   myFile.print(", ");
-  myFile.print(tlFlap);
+  myFile.println(currentState);
   myFile.print(", ");
-  myFile.print(trFlap);
+  myFile.println(dz);
   myFile.print(", ");
-  myFile.print(blFlap);
-  myFile.print(", ");
-  myFile.print(brFlap);
-  myFile.println();
+  myFile.println(motorPower);
 }
 
 void saveSD(){
@@ -143,11 +144,11 @@ void printData(){
 
   /* Display the results (acceleration is measured in m/s^2) */
   Serial.print("\t\tAccel X: ");
-  Serial.print(accel.acceleration.x);
+  Serial.print(ax);
   Serial.print(" \tY: ");
-  Serial.print(accel.acceleration.y);
+  Serial.print(ay);
   Serial.print(" \tZ: ");
-  Serial.print(accel.acceleration.z);
+  Serial.print(az);
   Serial.println(" m/s^2 ");
 
   /* Display the results (rotation is measured in rad/s) */
@@ -160,13 +161,13 @@ void printData(){
   Serial.println(" radians/s ");
   Serial.println();
 
-  Serial.print("\t\tMag X: ");
-  Serial.print(mag.magnetic.x);
-  Serial.print(" \tY: ");
-  Serial.print(mag.magnetic.y);
-  Serial.print(" \tZ: ");
-  Serial.print(mag.magnetic.z);
-  Serial.println(" uT");
+  // Serial.print("\t\tMag X: ");
+  // Serial.print(mag.magnetic.x);
+  // Serial.print(" \tY: ");
+  // Serial.print(mag.magnetic.y);
+  // Serial.print(" \tZ: ");
+  // Serial.print(mag.magnetic.z);
+  // Serial.println(" uT");
 
   Serial.print("\t\tpressure = "); Serial.print(pressure); Serial.println(" hPa");
   Serial.print("\t\taltitude = "); Serial.print(altitude); Serial.println(" m");
@@ -176,55 +177,37 @@ void printData(){
   Serial.print("\t\tPitch: "); Serial.print(pitch); Serial.print(" Roll: "); Serial.println(roll);
   Serial.print ("\t\tLoop Time: "); Serial.println(rollingLoopTime);
   Serial.print("\t\tError: "); Serial.println(sensorError);
-
-  Serial.print("\t\tTop Left Error: "); Serial.print(topLeftError); Serial.print("\tTop Right Error: "); Serial.print(topRightError); Serial.print("\tBottom Left Error: "); Serial.print(bottomLeftError); Serial.print("\tBottom Right Error: "); Serial.println(bottomRightError);
-
-  Serial.print("receiver"); Serial.print(", ");Serial.print(onTime); Serial.print(", ");Serial.print(offTime);Serial.print(", start delay: ");Serial.print(loop_start_millis - delay_start_millis);
+  Serial.print("\t\tState: "); Serial.println(currentState); 
+  Serial.print("\t\tDz: "); Serial.println(dz);
+  Serial.print("\t\tMotor Power: ");Serial.println(motorPower);
 
 }
 
-void pwmChange(){
-  if(digitalRead(39) == HIGH){
-    risingEdgeTime = millis();
-    offTime = risingEdgeTime - fallingEdgeTime;
+int beepLoopCount = 0;
+void statusBeep(){
+  switch (currentState){
+    case WAITING:
+      if(beepLoopCount < 1){
+        digitalWrite(buzzer, LOW);
+      }else{
+        digitalWrite(buzzer, HIGH);
+      }
+      break;
+    //base case
+    default:
+      if(beepLoopCount < 8){
+        digitalWrite(buzzer, LOW);
+      }else{
+        digitalWrite(buzzer, HIGH);
+      }
   }
-  else{
-    fallingEdgeTime = millis();
-    onTime = millis() - risingEdgeTime;
-  }
-  
+  beepLoopCount++;
+  if (beepLoopCount > 10) beepLoopCount = 0;
+
 }
 
 void setup(void) {
   Serial.begin(115200);
-
-  topLeft.attachServo();
-  topRight.attachServo();
-  bottomLeft.attachServo();
-  bottomRight.attachServo();
-
-  //attachInterrupt(digitalPinToInterrupt(39), pwmChange, CHANGE);
-
-  // topLeft.calibrate(); //1775 is down, 885 is up
-  // topRight.calibrate(); // 1165 is down, 1955 is up
-  // bottomLeft.calibrate(); //995 is down, 1930 is up
-  // bottomRight.calibrate(); //1525 is down, 705 is upq
-
-  // topLeft.writePercentage(0);
-  // topRight.writePercentage(0);
-  // bottomLeft.writePercentage(0);
-  // bottomRight.writePercentage(0);
-
-  // delay(600);
-
-  // topLeft.writePercentage(100);
-  // topRight.writePercentage(100);
-  // bottomLeft.writePercentage(100);
-  // bottomRight.writePercentage(100);
-
-  // delay(600);
-
-  // Initialize peripherals
 
   if (!icm.begin_I2C()) {
     Serial.println("Failed to find ICM20948 chip (accelerometer, gyroscope, magnetometer)!");
@@ -265,7 +248,7 @@ void setup(void) {
   }
 
 
-  myFile.print("Temperature (Accel), Accel X, Accel Y, Accel Z, Gyro X, Gyro Y, Gyro Z, Mag X, Mag Y, Mag Z, Temp (baro), Pressure (baro), Pitch, Roll, Time, Sensor Error, TL, TR, BL, BR\n");
+  myFile.print("Temperature (Accel), Accel X, Accel Y, Accel Z, Gyro X, Gyro Y, Gyro Z, Mag X, Mag Y, Mag Z, Temp (baro), Pressure (baro), Pitch, Roll, Time, Sensor Error, State, Dz\n");
 
   Serial.println("ICM20948 Found!");
   icm_temp = icm.getTemperatureSensor();
@@ -285,18 +268,10 @@ void setup(void) {
   bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
   bmp.setOutputDataRate(BMP3_ODR_50_HZ);
 
-  Serial.println("Setup complete! Waiting for release.");
-
-
-  // topLeft.writePercentage(100);
-  // topRight.writePercentage(100);
-  // bottomLeft.writePercentage(0);
-  // bottomRight.writePercentage(0); 
-
-  //while(onTime < 2){  }
-  
   delay_start_millis = millis();
 
+  release.attach(servo);
+  release.writeMicroseconds(2000); // 2000 closed, 950 open
 
   if(DEBUG){ 
     printDataTimer.begin(printData, 100000); // 10 hz printing
@@ -304,24 +279,20 @@ void setup(void) {
     logDataTimer.begin(logData, 50000); // 20 hz logging
     saveSDTimer.begin(saveSD, 2000000); // 0.5 hz saving to SD
   }
-  //detachInterrupt(digitalPinToInterrupt(39));
+
+  statusBeepTimer.begin(statusBeep, 100000);
 
 }
 
-int loopCount = 0;
-
-float cumAx = 0;
-float cumAy = 0;
-float cumAz = 0;
-
-float ax = 0;
-float ay = 0;
-float az = 0;
 
 void loop() {
   if(loop_start_millis == 0){
     loop_start_millis = millis();
   }
+
+  az = accel.acceleration.x;
+  ay = accel.acceleration.y;
+  ax = accel.acceleration.z;
 
   previousLoopTime = currentLoopTime;
   currentLoopTime = millis();
@@ -337,37 +308,128 @@ void loop() {
   altitude = bmp.readAltitude(1013.25);
   temperature = bmp.temperature;
 
-  ax = alpha * accel.acceleration.y + (1 - alpha) * ax;
-  ay = alpha * accel.acceleration.x + (1 - alpha) * ay;
-  az = alpha * accel.acceleration.z + (1 - alpha) * az;
+  dz = (altitude - previousAltitude) / (rollingLoopTime / 1000);
+  previousAltitude = altitude;
 
-  pitch = (atan2(ay, sqrt(ax * ax + az * az)) * 180 / M_PI) * pitch_sensitivity;
-  roll = (atan2(ax, sqrt(ay * ay + az * az)) * 180 / M_PI) * roll_sensitivity;
+  roll = (atan2(ay, sqrt(ax * ax + az * az)) * 180 / M_PI);
+  pitch = (atan2(az, sqrt(ay * ay + ax * ax)) * 180 / M_PI);
 
-  topLeftError = pitch + roll;
-  topRightError = pitch - roll;
-  bottomLeftError = -pitch + roll;
-  bottomRightError = -pitch - roll;
+  switch(currentState){
+    case WAITING:
+      waiting_state();
+      break;
+    case LAUNCHED:
+      launched_state();
+      break;
+    case APOGEE:
+      apogee_state();
+      break;
+    case BELLYFLOP:
+      bellyflop_state();
+      break;
+    case CHUTE:
+      chute_state();
+      break;
+    case LANDED:
+      break;
+  }
 
-  float d_tle = topLeftError - previousTopLeftError;
-  float d_tre = topRightError - previousTopRightError;
-  float d_ble = bottomLeftError - previousBottomLeftError;
-  float d_bre = bottomRightError - previousBottomLeftError;
+}
 
-  tlFlap = P*topLeftError + D*d_tle + neutral_angle;
-  trFlap = P*topRightError + D*d_tre+ neutral_angle;
-  blFlap = P*bottomLeftError + D*d_ble + neutral_angle;
-  brFlap = P*bottomRightError + D*d_bre+ neutral_angle;
+float ignitionConditionsMet = 0;
+int launchTime = 0;
+float launchAltitude = 0;
+void waiting_state(){
+  
 
-  topLeft.writePercentage(tlFlap);
-  topRight.writePercentage(trFlap);
-  bottomLeft.writePercentage(blFlap);
-  bottomRight.writePercentage(brFlap);
 
-  previousTopLeftError = topLeftError;
-  previousTopRightError = topRightError;
-  previousBottomLeftError = bottomLeftError;
-  previousBottomRightError = bottomRightError;
+  //Next state
+  if(az > 20) ignitionConditionsMet += 1;
+  if(dz > 10) ignitionConditionsMet += 1;
+
+  if(ignitionConditionsMet > 10){
+    launchTime = millis();
+    launchAltitude = altitude; //Not ideal: altitude will be higher than actual launch altitude
+    currentState = LAUNCHED;
+  }
+
+  ignitionConditionsMet -= 0.5;
+}
+
+float apogeeConditionsMet = 0;
+float maxAltitude = 0;
+int apogeeTime = 0;
+void launched_state(){
+
+  //Next state
+  if(millis() - launchTime > 13000) apogeeConditionsMet += 1;
+  if(abs(az) < 7) apogeeConditionsMet += 1;
+  if((altitude - maxAltitude) < 100) apogeeConditionsMet += 1;
+  if(dz < 5) apogeeConditionsMet += 1;
+
+  if(apogeeConditionsMet > 10){
+    apogeeTime = millis();
+    maxAltitude = altitude;
+    currentState = APOGEE;
+  }
+  apogeeConditionsMet -= 1;
+
+}
+
+
+void apogee_state(){
+  release.writeMicroseconds(950);
+
+  //Next state
+  if(millis() - apogeeTime > 500) currentState = BELLYFLOP;
+}
+
+float chuteConditionsMet = 0;
+int chuteIgnitionTime = 0;
+void bellyflop_state(){
+  release.writeMicroseconds(950);  
+
+  motorPower = pitch * sensitivity;
+
+  if(motorPower > 0){
+    digitalWrite(motor_1, LOW);
+    analogWrite(motor_2, abs(motorPower));
+  }else{
+    digitalWrite(motor_2, LOW);
+    analogWrite(motor_1, abs(motorPower));
+  }
+
+
+  //Next state
+  if(altitude - launchAltitude < 100) chuteConditionsMet += 1;
+  if(pitch < -60 && az < 4) chuteConditionsMet += 0.15; //Takes 2.4 seconds before moving on at just pitch
+  if(dz > 70) chuteConditionsMet += 0.1;
+
+  chuteConditionsMet -= 0.1;
+
+  if(chuteConditionsMet > 10){
+    chuteIgnitionTime = millis();
+    currentState = CHUTE;
+  }
+
+}
+
+
+void chute_state(){ //DANGER - Only bellyflop should transition into this
+  if(chuteIgnitionTime == 0){
+    chuteIgnitionTime = millis();
+  }
+  if(millis() - chuteIgnitionTime < 5000){
+    digitalWrite(ematch_1, HIGH);
+    digitalWrite(ematch_2, LOW);
+  // }else if (millis() - chuteIgnitionTime < 10000){
+  //   digitalWrite(ematch_1, LOW);
+  //   digitalWrite(ematch_2, HIGH);
+  }else{
+    digitalWrite(ematch_1, LOW);
+    digitalWrite(ematch_2, LOW);
+  }
+
 }
 
 
